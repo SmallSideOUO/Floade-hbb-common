@@ -259,6 +259,35 @@ impl Clone for WebRTCStream {
 }
 
 impl WebRTCStream {
+    pub fn relay_allowed() -> bool {
+        config::APP_NAME.read().map(|name| name.as_str() != "FloadeRemote").unwrap_or(false)
+    }
+
+    pub fn ensure_relay_allowed() -> ResultType<()> {
+        if !Self::relay_allowed() {
+            anyhow::bail!("Floade requires a direct P2P connection; relay is disabled.");
+        }
+        Ok(())
+    }
+
+    fn is_relay_candidate(candidate: &str) -> bool {
+        candidate.split_whitespace().nth(7) == Some("relay")
+    }
+
+    fn remote_description(json: &str, allow_relay: bool) -> ResultType<RTCSessionDescription> {
+        if allow_relay {
+            return Ok(serde_json::from_str(json)?);
+        }
+        let mut value: serde_json::Value = serde_json::from_str(json)?;
+        if let Some(sdp) = value.get("sdp").and_then(|sdp| sdp.as_str()) {
+            let direct = sdp.lines().filter(|line| {
+                !line.starts_with("a=candidate:") || !Self::is_relay_candidate(line)
+            }).map(|line| format!("{line}\r\n")).collect::<String>();
+            value["sdp"] = direct.into();
+        }
+        Ok(serde_json::from_value(value)?)
+    }
+
     #[inline]
     fn get_remote_offer(endpoint: &str) -> ResultType<String> {
         // Ensure the endpoint starts with the "webrtc://" prefix
@@ -402,6 +431,9 @@ impl WebRTCStream {
     fn get_ice_server_from_url(url: &str) -> Option<RTCIceServer> {
         let u = Url::parse(url).ok()?;
         if !matches!(u.scheme(), "turn" | "turns" | "stun" | "stuns") {
+            return None;
+        }
+        if !Self::relay_allowed() && matches!(u.scheme(), "turn" | "turns") {
             return None;
         }
         // Two accepted spellings parse differently: `turn://user:pass@host:port` has an authority
@@ -574,6 +606,9 @@ impl WebRTCStream {
         force_relay: bool,
         ms_timeout: u64,
     ) -> ResultType<Self> {
+        if force_relay {
+            Self::ensure_relay_allowed()?;
+        }
         let Some(rt) = WEBRTC_RT.as_ref() else {
             return Err(anyhow::anyhow!("WebRTC I/O runtime unavailable"));
         };
@@ -853,7 +888,7 @@ impl WebRTCStream {
                 log::debug!("Start webrtc with local key: {}", k);
                 Ok((k, endpoint))
             } else {
-                let sdp = serde_json::from_str::<RTCSessionDescription>(&remote_offer)?;
+                let sdp = Self::remote_description(&remote_offer, Self::relay_allowed())?;
                 pc.set_remote_description(sdp.clone()).await?;
                 let answer = pc.create_answer(None).await?;
                 let endpoint = Self::trickle_endpoint(&answer, force_relay)?;
@@ -1045,7 +1080,7 @@ impl WebRTCStream {
     pub async fn set_remote_endpoint(&self, endpoint: &str) -> ResultType<()> {
         let offer = Self::get_remote_offer(endpoint)?;
         log::debug!("WebRTC set remote sdp ({} bytes)", offer.len());
-        let sdp = serde_json::from_str::<RTCSessionDescription>(&offer)?;
+        let sdp = Self::remote_description(&offer, Self::relay_allowed())?;
         self.pc.set_remote_description(sdp).await?;
         Ok(())
     }
@@ -1113,6 +1148,9 @@ impl WebRTCStream {
             return Ok(());
         }
         let candidate = serde_json::from_str::<RTCIceCandidateInit>(candidate_json)?;
+        if !Self::relay_allowed() && Self::is_relay_candidate(&candidate.candidate) {
+            return Ok(());
+        }
         self.pc.add_ice_candidate(candidate).await?;
         Ok(())
     }
@@ -1547,6 +1585,37 @@ mod tests {
     use tokio::sync::Barrier;
     use tokio::time::timeout;
     use webrtc::peer_connection::sdp::session_description::RTCSessionDescription;
+
+    #[tokio::test]
+    async fn strict_p2p_refuses_relay_and_turn_before_connecting() {
+        let previous = {
+            let mut name = crate::config::APP_NAME.write().unwrap();
+            std::mem::replace(&mut *name, "FloadeRemote".to_owned())
+        };
+        let relay_error = WebRTCStream::ensure_relay_allowed().unwrap_err().to_string();
+        let turn = WebRTCStream::get_ice_server_from_url("turn://user:pass@example.com:3478");
+        let stun = WebRTCStream::get_ice_server_from_url("stun:example.com:3478");
+        let forced = WebRTCStream::new("", true, 1).await.err().map(|e| e.to_string());
+        *crate::config::APP_NAME.write().unwrap() = previous;
+        assert!(relay_error.contains("relay is disabled"));
+        assert!(turn.is_none());
+        assert!(stun.is_some());
+        assert!(forced.unwrap().contains("relay is disabled"));
+        assert!(WebRTCStream::relay_allowed());
+    }
+
+    #[test]
+    fn strict_p2p_filters_remote_relay_candidates_in_sdp_and_trickle() {
+        let direct = "candidate:1 1 udp 123 192.0.2.1 1234 typ srflx";
+        let relay = "candidate:2 1 udp 123 192.0.2.2 2345 typ relay raddr 192.0.2.1 rport 1234";
+        let json = serde_json::json!({"type":"offer", "sdp": format!("v=0\r\na={direct}\r\na={relay}\r\n")}).to_string();
+        let filtered = WebRTCStream::remote_description(&json, false).unwrap();
+        assert!(filtered.sdp.contains(direct));
+        assert!(!filtered.sdp.contains(relay));
+        assert!(WebRTCStream::remote_description(&json, true).unwrap().sdp.contains(relay));
+        assert!(!WebRTCStream::is_relay_candidate(direct));
+        assert!(WebRTCStream::is_relay_candidate(relay));
+    }
 
     async fn new_test_stream() -> WebRTCStream {
         WebRTCStream::new("", false, 10000).await.unwrap()
